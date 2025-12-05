@@ -1339,15 +1339,13 @@ def convert_exported_program_to_serialized_trt_engine(
             )
 
     flattened_input_list = get_flat_args_with_check(
-        exported_program, list(trt_arg_inputs), trt_kwarg_inputs  # type: ignore
+        exported_program, list(trt_arg_inputs), trt_kwarg_inputs
     )[0]
 
     try:
         interpreter_result = interpret_module_to_result(
             gm,
             inputs=flattened_input_list,
-            arg_inputs=list(trt_arg_inputs),
-            kwarg_inputs=trt_kwarg_inputs,
             settings=settings,
             engine_cache=engine_cache,
         )
