@@ -1,11 +1,18 @@
 """
-Minimal reproducible example demonstrating TensorRT fp16 custom_op() issue.
+Using Custom Kernels with NVRTC in TensorRT AOT Plugins
+=======================================================
 
-This module shows the bug where torch_tensorrt.dynamo.conversion.plugins.custom_op()
-fails to compile operations that use fp16 (half-precision) tensors.
+This example demonstrates how to use the NVIDIA Runtime Compilation (NVRTC) library
+to compile custom CUDA kernels at runtime and integrate them into a TensorRT
+Ahead-Of-Time (AOT) plugin.
 
-The issue occurs because the JIT plugin generator doesn't properly declare format
-support for fp16 data types in the generated TensorRT plugin.
+This approach is powerful because it allows you to:
+1. Write raw CUDA C++ code for maximum performance.
+2. Compile it on-the-fly, adapting to the specific GPU architecture.
+3. Wrap it in a TensorRT plugin without writing a separate C++ plugin library.
+4. Integrate it seamlessly into Torch-TensorRT's compilation flow.
+
+The example performs a simple pointwise Sigmoid operation: f(x) = 1 / (1 + exp(-x)).
 """
 
 from typing import List, Tuple, Union
@@ -14,8 +21,13 @@ import torch
 
 import torch_tensorrt
 
-# CUDA kernel source (NVRTC) used by the torch custom op
-# Note: TensorRT passes args as: inputs, extra_args, outputs
+# ============================================================================
+# 1. Define the CUDA Kernel Source
+# ============================================================================
+# We define the CUDA kernel source code as a Python string.
+# This code will be compiled by NVRTC.
+# Note that we use extern "C" to avoid name mangling, making it easier to
+# retrieve the kernel function by name later.
 
 cu_code = """
 // Simple pointwise Sigmoid kernel: f(x) = 1 / (1 + exp(-x))
@@ -32,35 +44,49 @@ extern "C" __global__ void pointwise_sigmoid_kernel_nvrtc(const float* __restric
 }
 """
 
-# Prepare NVRTC program, kernel, and stream once (simple eager path)
+# ============================================================================
+# 2. Compile the Kernel using NVRTC (for eager mode)
+# ============================================================================
+# Before defining the Torch custom op, we compile the kernel so we can run it
+# in standard PyTorch (eager mode) for verification and testing.
+# We use the cuda-python library's NVRTC bindings.
+
 from cuda.core.experimental import Device as _CudaDevice
 from cuda.core.experimental import LaunchConfig as _LaunchConfig
 from cuda.core.experimental import Program as _CudaProgram
 from cuda.core.experimental import ProgramOptions as _CudaProgramOptions
 from cuda.core.experimental import launch as _cuda_launch
 
+# Initialize CUDA device and stream
 _cuda_device = _CudaDevice()
 _cuda_device.set_current()
 _cuda_stream = _cuda_device.create_stream()
+
+# Configure compilation options
 _program_options = _CudaProgramOptions(
     std="c++17",
-    arch=f"sm_{_cuda_device.arch}",
+    arch=f"sm_{_cuda_device.arch}",  # Target the current GPU architecture
     include_path=["/usr/local/cuda/include"],
 )
+
+# Create and compile the program
 _program = _CudaProgram(cu_code, code_type="c++", options=_program_options)
 _module = _program.compile("ptx", name_expressions=("pointwise_sigmoid_kernel_nvrtc",))
 _kernel = _module.get_kernel("pointwise_sigmoid_kernel_nvrtc")
 
-# Eager torch custom_op implemented using the CUDA kernel above (no Triton)
-
 
 # ============================================================================
-# Custom Op Registration
+# 3. Register Custom Op in PyTorch
 # ============================================================================
-
+# We register the custom operation with PyTorch so it can be used in models.
+# The 'mutates_args=()' argument tells PyTorch this op is functional (doesn't modify inputs in-place).
 
 @torch.library.custom_op("pointwise_sigmoid_ops::pointwise_sigmoid", mutates_args=())  # type: ignore[misc]
 def pointwise_sigmoid(X: torch.Tensor) -> torch.Tensor:
+    """
+    Implementation of the custom op for PyTorch eager execution.
+    This function launches the pre-compiled NVRTC kernel.
+    """
     assert X.is_cuda, "Tensor must be on CUDA device."
     assert X.dtype == torch.float32, "For this test, expected float32 input"
 
@@ -68,11 +94,10 @@ def pointwise_sigmoid(X: torch.Tensor) -> torch.Tensor:
     N = int(X.numel())
 
     block = 256
-
     grid_x = max(1, (N + block - 1) // block)
     config = _LaunchConfig(grid=(grid_x), block=(block))
 
-    # Use PyTorch's current stream by wrapping it for cuda.core
+    # Helper class to wrap PyTorch's stream for cuda-python
     class _PyTorchStreamWrapper:
         def __init__(self, pt_stream):
             self.pt_stream = pt_stream
@@ -84,9 +109,7 @@ def pointwise_sigmoid(X: torch.Tensor) -> torch.Tensor:
     pt_stream = torch.cuda.current_stream()
     s = _cuda_device.create_stream(_PyTorchStreamWrapper(pt_stream))
 
-    # Launch kernel with raw pointers as in cuda.core example
-    # Note: argument order is input, size,   (matching TensorRT's convention)
-
+    # Launch kernel with raw pointers
     _cuda_launch(
         s,
         config,
@@ -99,6 +122,13 @@ def pointwise_sigmoid(X: torch.Tensor) -> torch.Tensor:
     return Y
 
 
+# ============================================================================
+# 4. Register Fake Implementation (Meta Kernel)
+# ============================================================================
+# The fake implementation is crucial for TorchDynamo. It tells the compiler
+# about the output shape and data type without actually running the kernel.
+# This is used during the tracing phase.
+
 @torch.library.register_fake("pointwise_sigmoid_ops::pointwise_sigmoid")
 def _(input: torch.Tensor) -> torch.Tensor:
     """Fake implementation for TorchDynamo tracing of base operation."""
@@ -106,27 +136,37 @@ def _(input: torch.Tensor) -> torch.Tensor:
 
 
 # ============================================================================
-# TensorRT Wrapper with custom_op() - THIS FAILS WITH FP16
+# 5. Define TensorRT AOT Plugin
 # ============================================================================
+# Now we define how this operation should be handled within TensorRT.
+# We use the TensorRT Python Plugin API to register the plugin description,
+# autotuning behavior, and the AOT implementation using NVRTC.
 
 import tensorrt.plugin as trtp
 from cuda.core.experimental import Device, LaunchConfig, Program, ProgramOptions
 
 
+# 5a. Plugin Description
+# Tells TensorRT about input/output properties (dtypes, formats)
 @trtp.register("pointwise_sigmoid_ops::pointwise_sigmoid")
 def sigmoid_plugin_desc(input: trtp.TensorDesc) -> Tuple[trtp.TensorDesc]:
     return (input.like(),)
 
 
+# 5b. Autotuning Support
+# Defines valid data type combinations for the plugin.
 @trtp.autotune("pointwise_sigmoid_ops::pointwise_sigmoid")
 def sigmoid_autotune(
     input: trtp.TensorDesc,
     outputs: Tuple[trtp.TensorDesc],
 ) -> List[trtp.AutoTuneCombination]:
-    # Match float32 path; add FP16 if you want both
+    # We specify that this plugin supports FP32 input and FP32 output
     return [trtp.AutoTuneCombination("FP32, FP32", "LINEAR")]
 
 
+# 5c. AOT Implementation
+# This is where the magic happens. We provide the compiled PTX code and
+# launch parameters to TensorRT. This code runs during engine building.
 @trtp.aot_impl("pointwise_sigmoid_ops::pointwise_sigmoid")
 def sigmoid_aot_nvrtc_impl(
     input: trtp.TensorDesc,
@@ -135,13 +175,10 @@ def sigmoid_aot_nvrtc_impl(
 ) -> Tuple[
     Union[str, bytes], Union[str, bytes], trtp.KernelLaunchParams, trtp.SymExprs
 ]:
-
+    # Get the PTX code from our pre-compiled module
     compiled_kernel = _module.code.decode("utf-8")
-    print(type(compiled_kernel))
-    print(compiled_kernel)
-
-    # import pdb; pdb.set_trace()
-
+    
+    # Calculate grid and block dimensions based on input shape
     N = input.shape_expr.numel()
     launch_params = trtp.KernelLaunchParams()
     block = 256
@@ -149,9 +186,11 @@ def sigmoid_aot_nvrtc_impl(
     launch_params.block_x = block
     launch_params.shared_mem = 0
 
+    # Pass the number of elements (N) as an extra argument to the kernel
     extra_args = trtp.SymIntExprs(1)
     extra_args[0] = trtp.SymInt32(N)
 
+    # Return: kernel name, PTX code, launch params, kernel arguments
     return (
         "pointwise_sigmoid_kernel_nvrtc",
         compiled_kernel,
@@ -159,6 +198,13 @@ def sigmoid_aot_nvrtc_impl(
         extra_args,
     )
 
+
+# ============================================================================
+# 6. Generate Plugin Converter
+# ============================================================================
+# This registers the mapping between the PyTorch custom op and the TensorRT plugin.
+# It tells Torch-TensorRT: "When you see 'pointwise_sigmoid_ops::pointwise_sigmoid',
+# replace it with the TensorRT plugin we just defined."
 
 torch_tensorrt.dynamo.conversion.plugins.generate_plugin_converter(
     "pointwise_sigmoid_ops::pointwise_sigmoid",
@@ -168,21 +214,15 @@ torch_tensorrt.dynamo.conversion.plugins.generate_plugin_converter(
 
 
 # ============================================================================
-# Test Model
+# 7. Test the Model
 # ============================================================================
-
 
 class PointwiseSigmoidModel_WithTRTWrapper(torch.nn.Module):
     """
     Test model that uses the TRT wrapper with custom_op() registration.
-
-    When compiled with torch_tensorrt.compile() using fp16 inputs, this will
-    fail with: "could not find any supported formats consistent with input/output
-    data types"
     """
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-
         z = torch.ops.pointwise_sigmoid_ops.pointwise_sigmoid(input)
         return z
 
@@ -191,10 +231,13 @@ if __name__ == "__main__":
     model = PointwiseSigmoidModel_WithTRTWrapper().to("cuda").eval()
     input = torch.randn(1, 1024, device="cuda", dtype=torch.float32)
 
+    print("PyTorch baseline result:")
     print(torch.sigmoid(input))
 
+    print("Custom Op eager result:")
     print(model(input))
 
+    print("\nCompiling with Torch-TensorRT...")
     with torch_tensorrt.logging.debug():
         trt_inputs = [input]
         model_trt = torch_tensorrt.compile(
@@ -204,11 +247,8 @@ if __name__ == "__main__":
             min_block_size=1,
         )
         print("Model compiled successfully!")
+        
         print("Running inference with compiled model...")
-        print("Compiled model output:")
-        print(model_trt(input))
-        print("Original model output:")
-        print(model(input))
         with torch.no_grad():
             for i in range(10):
                 res = model_trt(input)
@@ -216,4 +256,4 @@ if __name__ == "__main__":
                     res, model(input), rtol=1e-2, atol=1e-2
                 ), "Results do not match!"
 
-    # print("Inference successful!")
+    print("Inference successful!")
